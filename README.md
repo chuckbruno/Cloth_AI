@@ -222,12 +222,28 @@ XPBD 模拟器的最小可跑版本。**只**实现:粒子化 + Pin 约束 + 距
 | --- | --- | --- |
 | Black Threshold | 顶点色被认作"黑/固定"的阈值,与第八节调试工具保持一致 | 0.1 |
 | Weld Distance | 顶点焊接距离(本地空间);两个顶点位置距离小于此值会被合并为同一粒子。**用于把绳子末端和球网边缘正确缝合**。设为 0 关闭焊接 | 0.001 |
-| Substeps | 每 FixedUpdate 子步数 | 4 |
-| Iterations | 每子步约束迭代次数 | 12 |
+| Substeps | 每 FixedUpdate 子步数 | 2 |
+| Iterations | 每子步约束迭代次数 | 6 |
 | Gravity | 重力加速度(世界空间) | (0, −9.81, 0) |
-| Distance Compliance | XPBD 柔度,**0 = 完全刚性**;值越大越软。先用 0 看下垂正确性,然后调到 1e-6 / 1e-5 / 1e-4 看口袋 | 0 |
+| Distance Compliance | XPBD 柔度,**0 = 完全刚性**;值越大越软。当前默认先用用户实测可用值 | 1e-6 |
+| Enable Bending | 开启相邻三角面的弯曲约束,减少网面塌陷和折叠 | true |
+| Bending Compliance | 弯曲约束柔度,值越大越容易折叠/变软。当前默认先用用户实测可用值 | 0.01 |
+| Enable Ball Collision | 开启阶段 3 球体投影碰撞。当前只让球推开网,还不会给球反作用力 | true |
+| Collision Ball | 可选,手动指定参与碰撞的球 Rigidbody。为空时自动使用 BallPool 最近发射的球 | null |
+| Ball Pool | 可选,自动寻找当前活动球的对象池。为空时启动时会在场景中查找 | null |
+| Collision Skin | 球半径外额外推出距离,减少视觉穿插 | 0.01 |
+| Collision Radius Padding | 只用于网碰撞求解的额外半径。视觉球可以保持真实尺寸,这里补偿当前“粒子点 vs 球体”碰撞容易漏检的问题 | 0.11 |
+| Collision Search Margin | 球半径外检测余量,高速球可适当加大 | 0.05 |
+| Enable Ball Reaction | 开启阶段 4 反作用力,把网粒子碰撞修正转换成冲量推回 Rigidbody | true |
+| Collision Particle Mass | 把网粒子位置修正转换成球冲量的有效质量系数。它是调参值,不等于真实单个网格顶点质量 | 0.43 |
+| Reaction Impulse Scale | 反作用冲量缩放。越大球越容易减速/回弹 | 0.5 |
+| Max Reaction Impulse | 每个 FixedUpdate 给球的最大冲量,用于限制接触尖峰 | 6.5 |
+| Velocity Opposing Impulse Scale | 把接触修正量额外转换成沿球速度反方向的阻尼冲量,避免球面各方向修正互相抵消 | 1 |
 | Damping | 速度阻尼,每子步 `v *= (1 − damping)` | 0.02 |
 | Max Velocity | 速度上限(防止数值爆炸) | 50 |
+| Recalculate Normals | Mesh 写回后是否重算法线。密集球网调试时建议关闭 | false |
+| Recalculate Bounds | Mesh 写回后是否重算包围盒。球网保持在导入包围盒附近时建议关闭 | false |
+| Geometry Recalculate Interval | 开启法线/包围盒重算时,每 N 次 Mesh 写回执行一次 | 5 |
 | Draw Debug Gizmos | 选中时画红/绿粒子点 | false |
 | Pause Simulation | 暂停求解,定格画面方便观察 | false |
 
@@ -250,9 +266,23 @@ XPBD 模拟器的最小可跑版本。**只**实现:粒子化 + Pin 约束 + 距
 ### 调参建议(阶段 1)
 - 如果**绳子和网分开,绳子直接掉地上**:Weld Distance 不够大。FBX 中独立子网格的顶点几何上虽然重合,但拓扑不连。把 Weld Distance 调到 `0.005`(5mm)或 `0.01`(1cm)再 Play,Console 应当能看到 `[GoalNetMesh] Initialized: meshVerts=X, particles=Y (welded N away)...`,N 大于 0 才说明焊接生效
 - 如果**焊接把不该合的顶点合掉了**(例如两根近距离的绳子缠在一起):把 Weld Distance 调小
-- 如果**下垂太慢/不下垂**:Iterations 从 12 调到 6 看会不会反而下垂更明显(高刚性 + 高迭代会过度抑制运动);或把 Compliance 从 0 调到 1e-5
-- 如果**下垂剧烈抖动**:Substeps 从 4 调到 8;或把 Damping 从 0.02 调到 0.05
+- 如果**Play 模式非常卡**:先在 `GoalNetSimulator` 右键菜单执行 `Apply Realtime Preview Settings`,保持 Substeps = 2、Iterations = 6,并关闭 Recalculate Normals / Recalculate Bounds。2026-05-11 测试中,FPS 从约 2 提升到约 200。
+- 如果**下垂太慢/不下垂**:Iterations 可以从 6 临时调到 4 看下垂是否更明显(高刚性 + 高迭代会过度抑制运动);或把 Compliance 从 0 调到 1e-5
+- 如果**下垂剧烈抖动**:Substeps 从 2 调到 4 或 8;或把 Damping 从 0.02 调到 0.05
 - 如果**网像橡皮筋拉太长**:把 Compliance 调小或归 0
+- 如果**网面像纸一样塌平/折叠**:确认 Enable Bending 已开启,然后把 Bending Compliance 从 0.0005 往 0.0001 调小;如果变卡或过硬,再往 0.001 调大
+- 阶段 2 实测基线:Enable Bending 开启、Bending Compliance = 0.0005 时,网形可接受,FPS 约 70。后续接入球碰撞时建议用这个作为性能对比基线。
+- 阶段 3 注意:当前是**单向球体投影**。球会把网粒子推出球体形成凹陷,但球还不会被网减速或弹回;这是阶段 4 的反作用力目标。
+- 如果**球仍然明显穿过网**:先确认 Ball prefab 根对象有 `SphereCollider`,并且 `GoalNetSimulator` 能找到 BallPool;再尝试把 Collision Skin 调到 0.02 或把 Collision Search Margin 调到 0.1。
+- 阶段 4 调参:当前 `SoccerBall.prefab` 是 Mass = 1kg,有效 SphereCollider 半径约 0.25m。Launch Speed = 25m/s 时,把球停住本来就需要约 25 N*s 冲量,所以 Max Reaction Impulse 在 20 左右是合理量级。
+- 如果把足球改成真实半径 0.11m 后完全穿网,先检查 Transform Scale。如果球对象 Scale = 0.5,那么 SphereCollider Radius = 0.11 的有效半径只有 0.055m;要有效半径 0.11m,应设 SphereCollider Radius = 0.22,或把 Scale 改成 1。
+- 当前碰撞是“网粒子点 vs 球体”,真实半径的小球可能从粒子点之间穿过。保持视觉真实时,建议把 Collision Radius Padding 设到 0.06–0.12,让求解器用略大的隐形碰撞球捕捉接触。
+- 当前默认参数已按 2026-05-11 用户实测值固化:Distance Compliance = 1e-6,Bending Compliance = 0.01,Collision Radius Padding = 0.11,Collision Particle Mass = 0.43,Reaction Impulse Scale = 0.5,Max Reaction Impulse = 6.5。
+- 如果**只有很小一块网在动,缺少真实球网的大面积联动**:这不是单个参数能完全解决的问题。可以先把 Distance Compliance 提到 1e-5 或 1e-4、Iterations 提到 8–12 试试传播范围;后续更可靠的方向是做边/三角碰撞、碰撞影响邻域扩散、空气阻尼/全局 damping 调整,让冲击能量沿网线传出去。
+- 如果球几乎不减速,优先把 Collision Particle Mass 保持在 0.5 或更高,Max Reaction Impulse 保持在 20 左右,再把 Reaction Impulse Scale 从 0.35 提到 0.5 或 0.8;如果球被猛烈弹飞,先把 Reaction Impulse Scale 降到 0.2,再把 Max Reaction Impulse 往 10 降。
+- `Collision Ball = None` 是正常状态:模拟器会通过 BallPool 自动使用最近发射的球。只有在场景里没有 BallPool、或想固定测试某一个手动摆放的球时,才需要把该球的 Rigidbody 拖到 Collision Ball。
+- 如果球仍然几乎不减速,优先把 Velocity Opposing Impulse Scale 从 1 调到 2;这比盲目增大 Collision Skin 更直接。
+- 如果**接触瞬间掉帧明显**:先保持 Realtime Preview Settings,然后临时把 Iterations 从 6 降到 4,或把 Collision Search Margin 从 0.05 降到 0.02。确认效果后再慢慢加回质量。
 
 ---
 
@@ -264,9 +294,9 @@ XPBD 模拟器的最小可跑版本。**只**实现:粒子化 + Pin 约束 + 距
 | --- | --- | --- |
 | 0 | 顶点色调试工具 | 已交付 |
 | 1 | 数据骨架 + 重力下垂 | 已交付 |
-| 2 | 弯曲约束(网形不塌陷) | 待开发 |
-| 3 | 球-网碰撞投影(网躲球,出口袋) | 待开发 |
-| 4 | 反作用力(球被网吸住、回弹) | 待开发 |
+| 2 | 弯曲约束(网形不塌陷) | 已验收,FPS 约 70 |
+| 3 | 球-网碰撞投影(网躲球,出口袋) | 已接入,待 Unity 验收 |
+| 4 | 反作用力(球被网吸住、回弹) | 已接入,待 Unity 验收 |
 | 5 | 调参 + 空气动力 | 待开发 |
 
 完整设计见 `CLAUDE.md`。验收清单(第五节)会随阶段推进逐步打钩。

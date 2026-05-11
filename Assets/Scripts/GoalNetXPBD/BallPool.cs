@@ -30,6 +30,7 @@ namespace GoalNetXPBD
         private readonly Queue<GameObject> _available = new Queue<GameObject>();
         private readonly List<GameObject> _all = new List<GameObject>();
         private readonly Dictionary<GameObject, Coroutine> _autoReturnRoutines = new Dictionary<GameObject, Coroutine>();
+        private GameObject _lastActive;
 
         private bool _initialized;
 
@@ -92,6 +93,7 @@ namespace GoalNetXPBD
                 }
             }
             if (go == null) return null;
+            _lastActive = go;
 
             // Reset transform
             go.transform.SetParent(null, worldPositionStays: false);
@@ -169,6 +171,10 @@ namespace GoalNetXPBD
             go.transform.localPosition = Vector3.zero;
             go.transform.localRotation = Quaternion.identity;
             go.SetActive(false);
+            if (_lastActive == go)
+            {
+                _lastActive = FindAnyActive();
+            }
 
             // Avoid duplicates in the queue.
             if (!_available.Contains(go))
@@ -189,5 +195,32 @@ namespace GoalNetXPBD
         // Inspector helper.
         public int AvailableCount => _available.Count;
         public int TotalCount => _all.Count;
+
+        /// <summary>
+        /// Returns the most recently launched active ball, or another active pooled ball if that one was returned.
+        /// The cloth solver assumes only one ball is interacting with the net at a time.
+        /// </summary>
+        public GameObject CurrentActiveBall
+        {
+            get
+            {
+                if (_lastActive != null && _lastActive.activeSelf) return _lastActive;
+                _lastActive = FindAnyActive();
+                return _lastActive;
+            }
+        }
+
+        private GameObject FindAnyActive()
+        {
+            for (int i = 0; i < _all.Count; i++)
+            {
+                if (_all[i] != null && _all[i].activeSelf)
+                {
+                    return _all[i];
+                }
+            }
+
+            return null;
+        }
     }
 }
