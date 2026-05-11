@@ -1,0 +1,71 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# Unity generated files
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+sysinfo.txt
+
+# Unity crash reports
+[Mm]emoryCaptures/
+
+# Asset import worker / cache artifacts
+[Aa]ssets/AssetStoreTools*
+[Aa]ssets/StreamingAssets/aa.meta
+[Aa]ssets/StreamingAssets/aa/*
+
+# Visual Studio / Rider / JetBrains
+.vs/
+.idea/
+*.csproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Build outputs and packages
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# Logs and local diagnostics
+*.log
+
+# Keep Unity package and project settings tracked:
+#   Assets/
+#   Packages/manifest.json
+#   Packages/packages-lock.json
+#   ProjectSettings/
