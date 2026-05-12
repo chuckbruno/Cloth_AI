@@ -390,11 +390,32 @@ MonoBehaviour:
   collisionSkin: 0.01
   collisionRadiusPadding: 0.08
   collisionSearchMargin: 0.05
+  enableCollisionInfluenceSpread: 1
+  collisionSpreadStrength: 0.35
+  collisionSpreadRings: 2
+  collisionSpreadFalloff: 0.5
+  collisionSpreadReactionScale: 0.2
+  enableBallImpactDrive: 1
+  ballImpactDriveStrength: 0.45
+  ballImpactDriveMaxStep: 0.035
+  ballImpactDriveRings: 2
+  ballImpactDriveFalloff: 0.55
+  ballImpactDriveReactionScale: 0.05
+  enablePocketPressureField: 1
+  pocketPressureRadius: 0.55
+  pocketPressureStrength: 0.9
+  pocketPressureMaxStep: 0.08
+  pocketPressureFalloffPower: 1
+  pocketPressureReactionScale: 0.04
   enableBallReaction: 1
   collisionParticleMass: 0.5
   reactionImpulseScale: 0.8
   maxReactionImpulse: 10
   velocityOpposingImpulseScale: 1
+  enableSoftCatchReaction: 1
+  elasticReactionScale: 0.18
+  catchVelocityDamping: 0.65
+  maxContactReboundSpeed: 1.5
   damping: 0.02
   maxVelocity: 50
   recalculateNormals: 0
@@ -1005,7 +1026,7 @@ Transform:
   m_GameObject: {fileID: 1432044364}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.7092362, y: 1.52, z: 5.3}
+  m_LocalPosition: {x: 0.7092362, y: 0.95, z: 5.3}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []

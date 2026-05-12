@@ -56,6 +56,7 @@ namespace GoalNetXPBD
         public float[] invMass { get; private set; }
         public int[] vertexToParticle { get; private set; }
         public Edge[] edges { get; private set; }
+        public int[][] particleNeighbors { get; private set; }
         public BendingConstraint[] bendingConstraints { get; private set; }
 
         public bool Initialize(Mesh mesh, float blackThreshold, float weldDistance)
@@ -91,7 +92,7 @@ namespace GoalNetXPBD
             Debug.Log(
                 $"[GoalNetMesh] Initialized '{mesh.name}': " +
                 $"meshVerts={meshVertexCount}, particles={particleCount} (welded {weldedAway} away), " +
-                $"edges={edges.Length}, bending={bendingConstraints.Length}.");
+                $"edges={edges.Length}, bending={bendingConstraints.Length}, neighbors={GetAverageNeighborCount():0.0} avg.");
 
             return true;
         }
@@ -240,7 +241,45 @@ namespace GoalNetXPBD
             }
 
             edges = structural.ToArray();
+            particleNeighbors = BuildParticleNeighbors(structural);
             bendingConstraints = bending.ToArray();
+        }
+
+        private int[][] BuildParticleNeighbors(List<Edge> structural)
+        {
+            var neighbors = new List<int>[particleCount];
+            for (int i = 0; i < particleCount; i++)
+            {
+                neighbors[i] = new List<int>(4);
+            }
+
+            for (int i = 0; i < structural.Count; i++)
+            {
+                Edge edge = structural[i];
+                neighbors[edge.a].Add(edge.b);
+                neighbors[edge.b].Add(edge.a);
+            }
+
+            var result = new int[particleCount][];
+            for (int i = 0; i < particleCount; i++)
+            {
+                result[i] = neighbors[i].ToArray();
+            }
+
+            return result;
+        }
+
+        private float GetAverageNeighborCount()
+        {
+            if (particleNeighbors == null || particleNeighbors.Length == 0) return 0f;
+
+            int total = 0;
+            for (int i = 0; i < particleNeighbors.Length; i++)
+            {
+                total += particleNeighbors[i].Length;
+            }
+
+            return total / (float)particleNeighbors.Length;
         }
 
         private void AddStructuralEdge(int a, int b, HashSet<ulong> unique, List<Edge> result)

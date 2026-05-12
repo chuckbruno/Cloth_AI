@@ -53,7 +53,7 @@ namespace GoalNetXPBD
         [Min(0f)] public float bendingCompliance = 0.01f;
 
         [Header("Ball Collision (Phase 3)")]
-        [Tooltip("Enable one-way sphere projection: active ball pushes net particles out of its SphereCollider. No reaction force yet.")]
+        [Tooltip("Enable sphere projection: active ball pushes net particles out of its SphereCollider.")]
         public bool enableBallCollision = true;
 
         [Tooltip("Optional explicit ball. If empty, the simulator uses ballPool.CurrentActiveBall.")]
@@ -71,6 +71,60 @@ namespace GoalNetXPBD
         [Tooltip("Only particles within ball radius + this margin are checked. Larger values can catch faster motion but cost a little more.")]
         [Min(0f)] public float collisionSearchMargin = 0.05f;
 
+        [Header("Collision Influence Spread (Phase 4.5)")]
+        [Tooltip("Spread a fraction of each direct ball-collision correction to neighboring particles so the net forms a wider pocket.")]
+        public bool enableCollisionInfluenceSpread = true;
+
+        [Tooltip("Fraction of the direct collision correction applied to first-ring neighbors.")]
+        [Range(0f, 1f)] public float collisionSpreadStrength = 0.35f;
+
+        [Tooltip("How many structural-edge rings receive spread corrections. 1-2 is usually enough; higher costs more and can over-soften the net.")]
+        [Range(0, 3)] public int collisionSpreadRings = 2;
+
+        [Tooltip("Per-ring falloff after the first neighbor ring.")]
+        [Range(0f, 1f)] public float collisionSpreadFalloff = 0.5f;
+
+        [Tooltip("How much spread correction contributes to ball reaction impulse. Keep lower than 1 so pocket widening does not make the ball response too stiff.")]
+        [Range(0f, 1f)] public float collisionSpreadReactionScale = 0.2f;
+
+        [Header("Ball Impact Drive (Phase 4.7)")]
+        [Tooltip("Transfer part of the ball's motion to contacted net particles so impacts push the net deeper instead of only sliding particles around the sphere.")]
+        public bool enableBallImpactDrive = true;
+
+        [Tooltip("Fraction of ball displacement transferred to directly contacted particles each solver pass.")]
+        [Range(0f, 1f)] public float ballImpactDriveStrength = 0.45f;
+
+        [Tooltip("Maximum extra particle displacement from impact drive per solver pass, in meters.")]
+        [Min(0f)] public float ballImpactDriveMaxStep = 0.035f;
+
+        [Tooltip("How many structural-edge rings receive impact-drive displacement.")]
+        [Range(0, 3)] public int ballImpactDriveRings = 2;
+
+        [Tooltip("Per-ring falloff for impact-drive displacement.")]
+        [Range(0f, 1f)] public float ballImpactDriveFalloff = 0.55f;
+
+        [Tooltip("How much impact-drive displacement contributes to ball reaction impulse. Keep low because soft-catch damping already handles most deceleration.")]
+        [Range(0f, 1f)] public float ballImpactDriveReactionScale = 0.05f;
+
+        [Header("Pocket Pressure Field (Phase 4.8)")]
+        [Tooltip("When the ball is in contact, push nearby net particles in the ball velocity direction to create a deeper pocket.")]
+        public bool enablePocketPressureField = true;
+
+        [Tooltip("Extra radius around the solver ball that receives pocket pressure, in meters.")]
+        [Min(0f)] public float pocketPressureRadius = 0.55f;
+
+        [Tooltip("Fraction of ball displacement transferred to nearby particles by the pressure field.")]
+        [Range(0f, 2f)] public float pocketPressureStrength = 0.9f;
+
+        [Tooltip("Maximum extra particle displacement from pocket pressure per solver pass, in meters.")]
+        [Min(0f)] public float pocketPressureMaxStep = 0.08f;
+
+        [Tooltip("Falloff exponent from the ball surface to the outer pressure radius. Higher values focus pressure nearer the ball.")]
+        [Range(0.25f, 4f)] public float pocketPressureFalloffPower = 1f;
+
+        [Tooltip("How much pocket-pressure displacement contributes to ball reaction impulse.")]
+        [Range(0f, 1f)] public float pocketPressureReactionScale = 0.04f;
+
         [Header("Ball Reaction (Phase 4)")]
         [Tooltip("Apply the opposite of net particle collision corrections back to the active Rigidbody.")]
         public bool enableBallReaction = true;
@@ -86,6 +140,19 @@ namespace GoalNetXPBD
 
         [Tooltip("How much collision correction is converted into velocity-opposing catch impulse. Helps avoid symmetric particle corrections cancelling out.")]
         [Min(0f)] public float velocityOpposingImpulseScale = 1f;
+
+        [Header("Soft Catch Reaction (Phase 4.6)")]
+        [Tooltip("Use a damped catch model for ball reaction. This favors slowing the ball and limits immediate rebound speed.")]
+        public bool enableSoftCatchReaction = true;
+
+        [Tooltip("How much of the position-correction reaction remains as elastic pushback. Lower values let the ball press deeper into the net.")]
+        [Range(0f, 1f)] public float elasticReactionScale = 0.18f;
+
+        [Tooltip("Fraction of current ball velocity that contact damping may remove per FixedUpdate. Higher values catch harder; lower values allow deeper travel.")]
+        [Range(0f, 1f)] public float catchVelocityDamping = 0.45f;
+
+        [Tooltip("Maximum ball speed allowed in the reaction impulse direction immediately after contact. Prevents the net from kicking the ball away too quickly.")]
+        [Min(0f)] public float maxContactReboundSpeed = 1.5f;
 
         [Header("Stability")]
         [Tooltip("Velocity damping applied each substep: v *= (1 - damping). 0 = no damping, 1 = stop instantly.")]
@@ -129,6 +196,10 @@ namespace GoalNetXPBD
         private Vector3 _pendingBallImpulse;
         private float _pendingVelocityOpposingImpulse;
         private int _lastCollisionCount;
+        private int[] _spreadVisit;
+        private int[] _spreadFrontier;
+        private int[] _spreadNextFrontier;
+        private int _spreadVisitToken;
 
         private bool _initialized;
 
@@ -169,6 +240,9 @@ namespace GoalNetXPBD
             _meshLocalScratch = new Vector3[_data.meshVertexCount];
             _lambda = new float[_data.edges.Length];
             _bendingLambda = new float[_data.bendingConstraints.Length];
+            _spreadVisit = new int[n];
+            _spreadFrontier = new int[n];
+            _spreadNextFrontier = new int[n];
 
             // Particles start at rest pose, in world space.
             for (int i = 0; i < n; i++)
@@ -383,6 +457,7 @@ namespace GoalNetXPBD
             float radiusSqr = radius * radius;
 
             int n = _data.particleCount;
+            int directContacts = 0;
             for (int i = 0; i < n; i++)
             {
                 if (_data.invMass[i] <= 0f) continue;
@@ -394,36 +469,246 @@ namespace GoalNetXPBD
                 if (d2 > 1e-10f)
                 {
                     Vector3 oldPosition = _predicted[i];
-                    _predicted[i] = center + offset * (radius / Mathf.Sqrt(d2));
-                    AccumulateBallReaction(_predicted[i] - oldPosition, dt);
+                    Vector3 correction = center + offset * (radius / Mathf.Sqrt(d2)) - oldPosition;
+                    _predicted[i] = oldPosition + correction;
+                    AccumulateBallReaction(correction, dt);
+                    SpreadCollisionCorrection(i, correction, dt);
+                    ApplyBallImpactDrive(i, dt);
                 }
                 else
                 {
                     Vector3 oldPosition = _predicted[i];
-                    _predicted[i] = center + Vector3.up * radius;
-                    AccumulateBallReaction(_predicted[i] - oldPosition, dt);
+                    Vector3 correction = center + Vector3.up * radius - oldPosition;
+                    _predicted[i] = oldPosition + correction;
+                    AccumulateBallReaction(correction, dt);
+                    SpreadCollisionCorrection(i, correction, dt);
+                    ApplyBallImpactDrive(i, dt);
                 }
 
                 _lastCollisionCount++;
+                directContacts++;
+            }
+
+            if (directContacts > 0)
+            {
+                ApplyPocketPressureField(center, radius, dt);
             }
         }
 
         private void AccumulateBallReaction(Vector3 particleCorrection, float dt)
         {
-            if (!enableBallReaction || _collisionBody == null || dt <= 0f) return;
+            AccumulateBallReaction(particleCorrection, dt, 1f);
+        }
 
-            Vector3 particleImpulse = particleCorrection * (collisionParticleMass / dt);
+        private void AccumulateBallReaction(Vector3 particleCorrection, float dt, float scale)
+        {
+            if (!enableBallReaction || _collisionBody == null || dt <= 0f) return;
+            if (scale <= 0f) return;
+
+            Vector3 particleImpulse = particleCorrection * (collisionParticleMass * scale / dt);
             _pendingBallImpulse -= particleImpulse;
             _pendingVelocityOpposingImpulse += particleImpulse.magnitude;
+        }
+
+        private void SpreadCollisionCorrection(int sourceParticle, Vector3 directCorrection, float dt)
+        {
+            if (!enableCollisionInfluenceSpread || directCorrection.sqrMagnitude <= 1e-12f) return;
+            if (_data.particleNeighbors == null || _data.particleNeighbors.Length == 0) return;
+
+            int rings = Mathf.Clamp(collisionSpreadRings, 0, 3);
+            if (rings <= 0) return;
+
+            float firstRingScale = Mathf.Clamp01(collisionSpreadStrength);
+            if (firstRingScale <= 0f) return;
+
+            if (_spreadVisitToken == int.MaxValue)
+            {
+                System.Array.Clear(_spreadVisit, 0, _spreadVisit.Length);
+                _spreadVisitToken = 0;
+            }
+            _spreadVisitToken++;
+
+            int currentCount = 1;
+            _spreadFrontier[0] = sourceParticle;
+            _spreadVisit[sourceParticle] = _spreadVisitToken;
+
+            float ringScale = firstRingScale;
+            float falloff = Mathf.Clamp01(collisionSpreadFalloff);
+
+            for (int ring = 1; ring <= rings; ring++)
+            {
+                int nextCount = 0;
+                for (int i = 0; i < currentCount; i++)
+                {
+                    int particle = _spreadFrontier[i];
+                    int[] neighbors = _data.particleNeighbors[particle];
+
+                    for (int n = 0; n < neighbors.Length; n++)
+                    {
+                        int neighbor = neighbors[n];
+                        if (_spreadVisit[neighbor] == _spreadVisitToken) continue;
+
+                        _spreadVisit[neighbor] = _spreadVisitToken;
+                        _spreadNextFrontier[nextCount++] = neighbor;
+
+                        if (_data.invMass[neighbor] <= 0f) continue;
+
+                        Vector3 correction = directCorrection * ringScale;
+                        _predicted[neighbor] += correction;
+                        AccumulateBallReaction(correction, dt, collisionSpreadReactionScale);
+                    }
+                }
+
+                if (nextCount == 0) return;
+
+                int[] swap = _spreadFrontier;
+                _spreadFrontier = _spreadNextFrontier;
+                _spreadNextFrontier = swap;
+                currentCount = nextCount;
+                ringScale *= falloff;
+                if (ringScale <= 1e-4f) return;
+            }
+        }
+
+        private void ApplyBallImpactDrive(int sourceParticle, float dt)
+        {
+            if (!enableBallImpactDrive || _collisionBody == null || dt <= 0f) return;
+
+            Vector3 velocity = _collisionBody.velocity;
+            if (velocity.sqrMagnitude <= 1e-8f) return;
+
+            float solverPasses = Mathf.Max(1, iterations);
+            Vector3 drive = velocity * (dt * ballImpactDriveStrength / solverPasses);
+            float maxStep = ballImpactDriveMaxStep;
+            if (maxStep > 0f)
+            {
+                float magnitude = drive.magnitude;
+                if (magnitude > maxStep)
+                {
+                    drive *= maxStep / magnitude;
+                }
+            }
+
+            if (drive.sqrMagnitude <= 1e-12f) return;
+
+            ApplyDrivenCorrection(sourceParticle, drive, dt, ballImpactDriveReactionScale);
+
+            if (_data.particleNeighbors == null || _data.particleNeighbors.Length == 0) return;
+
+            int rings = Mathf.Clamp(ballImpactDriveRings, 0, 3);
+            if (rings <= 0) return;
+
+            if (_spreadVisitToken == int.MaxValue)
+            {
+                System.Array.Clear(_spreadVisit, 0, _spreadVisit.Length);
+                _spreadVisitToken = 0;
+            }
+            _spreadVisitToken++;
+
+            int currentCount = 1;
+            _spreadFrontier[0] = sourceParticle;
+            _spreadVisit[sourceParticle] = _spreadVisitToken;
+
+            float ringScale = Mathf.Clamp01(ballImpactDriveFalloff);
+
+            for (int ring = 1; ring <= rings; ring++)
+            {
+                int nextCount = 0;
+                for (int i = 0; i < currentCount; i++)
+                {
+                    int particle = _spreadFrontier[i];
+                    int[] neighbors = _data.particleNeighbors[particle];
+
+                    for (int n = 0; n < neighbors.Length; n++)
+                    {
+                        int neighbor = neighbors[n];
+                        if (_spreadVisit[neighbor] == _spreadVisitToken) continue;
+
+                        _spreadVisit[neighbor] = _spreadVisitToken;
+                        _spreadNextFrontier[nextCount++] = neighbor;
+
+                        ApplyDrivenCorrection(neighbor, drive * ringScale, dt, ballImpactDriveReactionScale);
+                    }
+                }
+
+                if (nextCount == 0) return;
+
+                int[] swap = _spreadFrontier;
+                _spreadFrontier = _spreadNextFrontier;
+                _spreadNextFrontier = swap;
+                currentCount = nextCount;
+                ringScale *= Mathf.Clamp01(ballImpactDriveFalloff);
+                if (ringScale <= 1e-4f) return;
+            }
+        }
+
+        private void ApplyDrivenCorrection(int particle, Vector3 correction, float dt, float reactionScale)
+        {
+            if (_data.invMass[particle] <= 0f) return;
+
+            _predicted[particle] += correction;
+            AccumulateBallReaction(correction, dt, reactionScale);
+        }
+
+        private void ApplyPocketPressureField(Vector3 center, float radius, float dt)
+        {
+            if (!enablePocketPressureField || _collisionBody == null || dt <= 0f) return;
+
+            Vector3 velocity = _collisionBody.velocity;
+            float speed = velocity.magnitude;
+            if (speed <= 1e-5f) return;
+
+            float extraRadius = pocketPressureRadius;
+            if (extraRadius <= 0f) return;
+
+            float influenceRadius = radius + extraRadius;
+            float influenceRadiusSqr = influenceRadius * influenceRadius;
+            float invExtraRadius = 1f / extraRadius;
+            float falloffPower = Mathf.Max(0.25f, pocketPressureFalloffPower);
+
+            float solverPasses = Mathf.Max(1, iterations);
+            Vector3 baseDrive = velocity * (dt * pocketPressureStrength / solverPasses);
+            float maxStep = pocketPressureMaxStep;
+            if (maxStep > 0f)
+            {
+                float baseMagnitude = baseDrive.magnitude;
+                if (baseMagnitude > maxStep)
+                {
+                    baseDrive *= maxStep / baseMagnitude;
+                }
+            }
+
+            if (baseDrive.sqrMagnitude <= 1e-12f) return;
+
+            int n = _data.particleCount;
+            for (int i = 0; i < n; i++)
+            {
+                if (_data.invMass[i] <= 0f) continue;
+
+                Vector3 offset = _predicted[i] - center;
+                float d2 = offset.sqrMagnitude;
+                if (d2 > influenceRadiusSqr) continue;
+
+                float distance = Mathf.Sqrt(d2);
+                float outsideSurface = Mathf.Max(0f, distance - radius);
+                float t = 1f - Mathf.Clamp01(outsideSurface * invExtraRadius);
+                float weight = Mathf.Pow(t, falloffPower);
+                if (weight <= 1e-4f) continue;
+
+                ApplyDrivenCorrection(i, baseDrive * weight, dt, pocketPressureReactionScale);
+            }
         }
 
         private void ApplyBallReactionImpulse()
         {
             if (!enableBallReaction || _collisionBody == null || _collisionBody.isKinematic) return;
 
-            Vector3 impulse = _pendingBallImpulse * reactionImpulseScale;
+            Vector3 impulse = enableSoftCatchReaction
+                ? BuildSoftCatchImpulse()
+                : _pendingBallImpulse * reactionImpulseScale;
+
             Vector3 velocity = _collisionBody.velocity;
-            if (_pendingVelocityOpposingImpulse > 0f && velocity.sqrMagnitude > 1e-8f)
+            if (!enableSoftCatchReaction && _pendingVelocityOpposingImpulse > 0f && velocity.sqrMagnitude > 1e-8f)
             {
                 impulse += -velocity.normalized * (_pendingVelocityOpposingImpulse * reactionImpulseScale * velocityOpposingImpulseScale);
             }
@@ -442,6 +727,43 @@ namespace GoalNetXPBD
             {
                 _collisionBody.AddForce(impulse, ForceMode.Impulse);
             }
+        }
+
+        private Vector3 BuildSoftCatchImpulse()
+        {
+            Vector3 velocity = _collisionBody.velocity;
+            Vector3 impulse = _pendingBallImpulse * reactionImpulseScale * elasticReactionScale;
+
+            float speed = velocity.magnitude;
+            if (_pendingVelocityOpposingImpulse > 0f && speed > 1e-5f)
+            {
+                float requestedDamping = _pendingVelocityOpposingImpulse * reactionImpulseScale * velocityOpposingImpulseScale;
+                float velocityDampingLimit = _collisionBody.mass * speed * Mathf.Clamp01(catchVelocityDamping);
+                float dampingImpulse = Mathf.Min(requestedDamping, velocityDampingLimit);
+                impulse += -velocity.normalized * dampingImpulse;
+            }
+
+            impulse = LimitContactRebound(velocity, impulse);
+            return impulse;
+        }
+
+        private Vector3 LimitContactRebound(Vector3 velocity, Vector3 impulse)
+        {
+            float maxRebound = maxContactReboundSpeed;
+            if (maxRebound <= 0f || impulse.sqrMagnitude <= 1e-10f) return impulse;
+
+            Vector3 reactionDirection = impulse.normalized;
+            float mass = Mathf.Max(_collisionBody.mass, 1e-5f);
+            float currentAlongReaction = Vector3.Dot(velocity, reactionDirection);
+            float impulseAlongReaction = Vector3.Dot(impulse, reactionDirection);
+            float predictedAlongReaction = currentAlongReaction + impulseAlongReaction / mass;
+
+            if (predictedAlongReaction <= maxRebound) return impulse;
+
+            float allowedImpulseAlongReaction = Mathf.Max(0f, (maxRebound - currentAlongReaction) * mass);
+            Vector3 along = reactionDirection * impulseAlongReaction;
+            Vector3 tangent = impulse - along;
+            return tangent + reactionDirection * allowedImpulseAlongReaction;
         }
 
         private void WriteBackToMesh()
@@ -505,11 +827,32 @@ namespace GoalNetXPBD
             collisionSkin = 0.01f;
             collisionRadiusPadding = 0.11f;
             collisionSearchMargin = 0.05f;
+            enableCollisionInfluenceSpread = true;
+            collisionSpreadStrength = 0.35f;
+            collisionSpreadRings = 2;
+            collisionSpreadFalloff = 0.5f;
+            collisionSpreadReactionScale = 0.2f;
+            enableBallImpactDrive = true;
+            ballImpactDriveStrength = 0.45f;
+            ballImpactDriveMaxStep = 0.035f;
+            ballImpactDriveRings = 2;
+            ballImpactDriveFalloff = 0.55f;
+            ballImpactDriveReactionScale = 0.05f;
+            enablePocketPressureField = true;
+            pocketPressureRadius = 0.55f;
+            pocketPressureStrength = 0.9f;
+            pocketPressureMaxStep = 0.08f;
+            pocketPressureFalloffPower = 1f;
+            pocketPressureReactionScale = 0.04f;
             enableBallReaction = true;
             collisionParticleMass = 0.43f;
             reactionImpulseScale = 0.5f;
             maxReactionImpulse = 6.5f;
             velocityOpposingImpulseScale = 1f;
+            enableSoftCatchReaction = true;
+            elasticReactionScale = 0.18f;
+            catchVelocityDamping = 0.45f;
+            maxContactReboundSpeed = 1.5f;
             recalculateNormals = false;
             recalculateBounds = false;
             geometryRecalculateInterval = 8;
@@ -526,11 +869,32 @@ namespace GoalNetXPBD
             collisionSkin = 0.01f;
             collisionRadiusPadding = 0.06f;
             collisionSearchMargin = 0.08f;
+            enableCollisionInfluenceSpread = true;
+            collisionSpreadStrength = 0.45f;
+            collisionSpreadRings = 2;
+            collisionSpreadFalloff = 0.55f;
+            collisionSpreadReactionScale = 0.25f;
+            enableBallImpactDrive = true;
+            ballImpactDriveStrength = 0.55f;
+            ballImpactDriveMaxStep = 0.05f;
+            ballImpactDriveRings = 2;
+            ballImpactDriveFalloff = 0.6f;
+            ballImpactDriveReactionScale = 0.08f;
+            enablePocketPressureField = true;
+            pocketPressureRadius = 0.65f;
+            pocketPressureStrength = 1.1f;
+            pocketPressureMaxStep = 0.1f;
+            pocketPressureFalloffPower = 0.9f;
+            pocketPressureReactionScale = 0.05f;
             enableBallReaction = true;
             collisionParticleMass = 0.5f;
             reactionImpulseScale = 0.5f;
             maxReactionImpulse = 25f;
             velocityOpposingImpulseScale = 1.25f;
+            enableSoftCatchReaction = true;
+            elasticReactionScale = 0.22f;
+            catchVelocityDamping = 0.75f;
+            maxContactReboundSpeed = 2f;
             recalculateNormals = true;
             recalculateBounds = false;
             geometryRecalculateInterval = 5;
