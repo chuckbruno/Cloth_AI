@@ -3,9 +3,9 @@ using UnityEngine;
 namespace GoalNetXPBD
 {
     /// <summary>
-    /// Phase-1 XPBD solver. Drives a single cloth (the goal net) under gravity, with
-    /// pin constraints and distance constraints. No bending, no aerodynamic, no ball
-    /// collision yet — those land in later phases.
+    /// XPBD solver for the goal net. Drives welded mesh particles with pin, distance,
+    /// bending, ball collision/reaction, impact pocket shaping, and simple ground contact
+    /// constraints.
     ///
     /// Particle vs mesh-vertex separation:
     ///   The mesh may contain coincident vertices coming from independent sub-meshes
@@ -146,13 +146,32 @@ namespace GoalNetXPBD
         public bool enableSoftCatchReaction = true;
 
         [Tooltip("How much of the position-correction reaction remains as elastic pushback. Lower values let the ball press deeper into the net.")]
-        [Range(0f, 1f)] public float elasticReactionScale = 0.18f;
+        [Range(0f, 1f)] public float elasticReactionScale = 0.905f;
 
         [Tooltip("Fraction of current ball velocity that contact damping may remove per FixedUpdate. Higher values catch harder; lower values allow deeper travel.")]
-        [Range(0f, 1f)] public float catchVelocityDamping = 0.45f;
+        [Range(0f, 1f)] public float catchVelocityDamping = 0.878f;
 
         [Tooltip("Maximum ball speed allowed in the reaction impulse direction immediately after contact. Prevents the net from kicking the ball away too quickly.")]
-        [Min(0f)] public float maxContactReboundSpeed = 1.5f;
+        [Min(0f)] public float maxContactReboundSpeed = 0.52f;
+
+        [Header("Ground Contact")]
+        [Tooltip("Prevent free net particles from moving below a horizontal ground plane.")]
+        public bool enableGroundCollision = true;
+
+        [Tooltip("Optional transform whose world Y is used as the ground height. Leave empty to use groundHeight.")]
+        public Transform groundTransform;
+
+        [Tooltip("World-space Y height of the ground plane when groundTransform is empty.")]
+        public float groundHeight = 0f;
+
+        [Tooltip("Small offset above the ground plane to reduce visual z-fighting and re-penetration.")]
+        [Min(0f)] public float groundSkin = 0.005f;
+
+        [Tooltip("Horizontal velocity damping for particles touching the ground. Higher values make the bottom of the net drag and pile up more.")]
+        [Range(0f, 1f)] public float groundFriction = 0.35f;
+
+        [Tooltip("Vertical velocity kept after hitting the ground. 0 = no bounce, 1 = perfectly elastic bounce.")]
+        [Range(0f, 1f)] public float groundBounce = 0f;
 
         [Header("Stability")]
         [Tooltip("Velocity damping applied each substep: v *= (1 - damping). 0 = no damping, 1 = stop instantly.")]
@@ -200,6 +219,7 @@ namespace GoalNetXPBD
         private int[] _spreadFrontier;
         private int[] _spreadNextFrontier;
         private int _spreadVisitToken;
+        private bool[] _groundContacts;
 
         private bool _initialized;
 
@@ -243,6 +263,7 @@ namespace GoalNetXPBD
             _spreadVisit = new int[n];
             _spreadFrontier = new int[n];
             _spreadNextFrontier = new int[n];
+            _groundContacts = new bool[n];
 
             // Particles start at rest pose, in world space.
             for (int i = 0; i < n; i++)
@@ -334,6 +355,7 @@ namespace GoalNetXPBD
             for (int i = 0; i < bCount; i++) _bendingLambda[i] = 0f;
 
             _lastCollisionCount = 0;
+            System.Array.Clear(_groundContacts, 0, _groundContacts.Length);
 
             for (int iter = 0; iter < iterations; iter++)
             {
@@ -348,6 +370,7 @@ namespace GoalNetXPBD
                 }
 
                 SolveBallCollision(dt);
+                SolveGroundCollision();
             }
 
             // 3. Recover velocities, commit predicted -> positions.
@@ -356,6 +379,7 @@ namespace GoalNetXPBD
             {
                 if (_data.isPinned[i]) continue;
                 _velocities[i] = (_predicted[i] - _positions[i]) * invDt;
+                ApplyGroundVelocityResponse(i);
                 _positions[i] = _predicted[i];
             }
 
@@ -699,6 +723,46 @@ namespace GoalNetXPBD
             }
         }
 
+        private void SolveGroundCollision()
+        {
+            if (!enableGroundCollision) return;
+
+            float floorY = GetGroundY() + groundSkin;
+            int n = _data.particleCount;
+            for (int i = 0; i < n; i++)
+            {
+                if (_data.invMass[i] <= 0f) continue;
+
+                Vector3 p = _predicted[i];
+                if (p.y >= floorY) continue;
+
+                p.y = floorY;
+                _predicted[i] = p;
+                _groundContacts[i] = true;
+            }
+        }
+
+        private void ApplyGroundVelocityResponse(int particle)
+        {
+            if (_groundContacts == null || !_groundContacts[particle]) return;
+
+            Vector3 v = _velocities[particle];
+            if (v.y < 0f)
+            {
+                v.y = -v.y * groundBounce;
+            }
+
+            float tangentKeep = 1f - groundFriction;
+            v.x *= tangentKeep;
+            v.z *= tangentKeep;
+            _velocities[particle] = v;
+        }
+
+        private float GetGroundY()
+        {
+            return groundTransform != null ? groundTransform.position.y : groundHeight;
+        }
+
         private void ApplyBallReactionImpulse()
         {
             if (!enableBallReaction || _collisionBody == null || _collisionBody.isKinematic) return;
@@ -850,9 +914,14 @@ namespace GoalNetXPBD
             maxReactionImpulse = 6.5f;
             velocityOpposingImpulseScale = 1f;
             enableSoftCatchReaction = true;
-            elasticReactionScale = 0.18f;
-            catchVelocityDamping = 0.45f;
-            maxContactReboundSpeed = 1.5f;
+            elasticReactionScale = 0.905f;
+            catchVelocityDamping = 0.878f;
+            maxContactReboundSpeed = 0.52f;
+            enableGroundCollision = true;
+            groundHeight = 0f;
+            groundSkin = 0.005f;
+            groundFriction = 0.35f;
+            groundBounce = 0f;
             recalculateNormals = false;
             recalculateBounds = false;
             geometryRecalculateInterval = 8;
@@ -892,9 +961,14 @@ namespace GoalNetXPBD
             maxReactionImpulse = 25f;
             velocityOpposingImpulseScale = 1.25f;
             enableSoftCatchReaction = true;
-            elasticReactionScale = 0.22f;
-            catchVelocityDamping = 0.75f;
-            maxContactReboundSpeed = 2f;
+            elasticReactionScale = 0.905f;
+            catchVelocityDamping = 0.878f;
+            maxContactReboundSpeed = 0.52f;
+            enableGroundCollision = true;
+            groundHeight = 0f;
+            groundSkin = 0.005f;
+            groundFriction = 0.45f;
+            groundBounce = 0f;
             recalculateNormals = true;
             recalculateBounds = false;
             geometryRecalculateInterval = 5;

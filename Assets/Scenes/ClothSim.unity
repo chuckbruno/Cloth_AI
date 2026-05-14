@@ -416,6 +416,12 @@ MonoBehaviour:
   elasticReactionScale: 0.18
   catchVelocityDamping: 0.65
   maxContactReboundSpeed: 1.5
+  enableGroundCollision: 1
+  groundTransform: {fileID: 409422303}
+  groundHeight: 0
+  groundSkin: 0.005
+  groundFriction: 0.35
+  groundBounce: 0
   damping: 0.02
   maxVelocity: 50
   recalculateNormals: 0
@@ -436,7 +442,7 @@ GameObject:
   - component: {fileID: 409422301}
   - component: {fileID: 409422300}
   m_Layer: 0
-  m_Name: Plane
+  m_Name: Ground
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -1269,7 +1275,6 @@ SceneRoots:
   - {fileID: 330585546}
   - {fileID: 410087041}
   - {fileID: 832575519}
-  - {fileID: 409422303}
   - {fileID: 1600339853}
   - {fileID: 1002506657}
   - {fileID: 164167052}
@@ -1277,3 +1282,4 @@ SceneRoots:
   - {fileID: 367963767}
   - {fileID: 743713207}
   - {fileID: 4007220077277910109}
+  - {fileID: 409422303}
