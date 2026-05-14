@@ -71,6 +71,31 @@ namespace GoalNetXPBD
         [Tooltip("Only particles within ball radius + this margin are checked. Larger values can catch faster motion but cost a little more.")]
         [Min(0f)] public float collisionSearchMargin = 0.05f;
 
+        [Header("Swept Ball Collision")]
+        [Tooltip("Use the ball's previous-to-current path as a swept sphere. This reduces high-speed tunneling through sparse net particles.")]
+        public bool enableSweptBallCollision = true;
+
+        [Tooltip("Check structural net edges against the swept sphere, not only particles. This catches balls passing between particles on a rope segment.")]
+        public bool enableSweptEdgeCollision = true;
+
+        [Tooltip("Extra radius used only for swept collision. Increase slightly if 45-50 m/s shots still leak through.")]
+        [Min(0f)] public float sweptCollisionSkin = 0.02f;
+
+        [Tooltip("Maximum correction applied by one swept contact per solver pass. Keeps high-speed hits from exploding the net.")]
+        [Min(0f)] public float sweptCollisionMaxCorrection = 0.12f;
+
+        [Tooltip("How much swept collision correction contributes to ball reaction impulse.")]
+        [Range(0f, 1f)] public float sweptCollisionReactionScale = 0.35f;
+
+        [Tooltip("How many early solver iterations run swept collision per substep. 1-2 is usually enough and avoids heavy contact-frame slowdowns.")]
+        [Range(1, 8)] public int sweptCollisionPassesPerSubstep = 2;
+
+        [Tooltip("Maximum swept edge contacts solved per solver pass. Prevents dense edge contact bursts from dropping FPS.")]
+        [Range(1, 128)] public int maxSweptEdgeContactsPerPass = 24;
+
+        [Tooltip("Allow swept edge contacts to trigger neighbor spreading. Expensive; usually keep disabled because particle contacts already spread the pocket.")]
+        public bool sweptEdgeInfluenceSpread = false;
+
         [Header("Collision Influence Spread (Phase 4.5)")]
         [Tooltip("Spread a fraction of each direct ball-collision correction to neighboring particles so the net forms a wider pocket.")]
         public bool enableCollisionInfluenceSpread = true;
@@ -136,7 +161,7 @@ namespace GoalNetXPBD
         [Min(0f)] public float reactionImpulseScale = 0.5f;
 
         [Tooltip("Maximum total impulse applied to the ball per FixedUpdate. A 1 kg ball at 25 m/s needs about 25 N*s to stop.")]
-        [Min(0f)] public float maxReactionImpulse = 6.5f;
+        [Min(0f)] public float maxReactionImpulse = 10f;
 
         [Tooltip("How much collision correction is converted into velocity-opposing catch impulse. Helps avoid symmetric particle corrections cancelling out.")]
         [Min(0f)] public float velocityOpposingImpulseScale = 1f;
@@ -146,13 +171,13 @@ namespace GoalNetXPBD
         public bool enableSoftCatchReaction = true;
 
         [Tooltip("How much of the position-correction reaction remains as elastic pushback. Lower values let the ball press deeper into the net.")]
-        [Range(0f, 1f)] public float elasticReactionScale = 0.905f;
+        [Range(0f, 1f)] public float elasticReactionScale = 0.813f;
 
         [Tooltip("Fraction of current ball velocity that contact damping may remove per FixedUpdate. Higher values catch harder; lower values allow deeper travel.")]
-        [Range(0f, 1f)] public float catchVelocityDamping = 0.878f;
+        [Range(0f, 1f)] public float catchVelocityDamping = 0.573f;
 
         [Tooltip("Maximum ball speed allowed in the reaction impulse direction immediately after contact. Prevents the net from kicking the ball away too quickly.")]
-        [Min(0f)] public float maxContactReboundSpeed = 0.52f;
+        [Min(0f)] public float maxContactReboundSpeed = 1.5f;
 
         [Header("Ground Contact")]
         [Tooltip("Prevent free net particles from moving below a horizontal ground plane.")]
@@ -172,6 +197,25 @@ namespace GoalNetXPBD
 
         [Tooltip("Vertical velocity kept after hitting the ground. 0 = no bounce, 1 = perfectly elastic bounce.")]
         [Range(0f, 1f)] public float groundBounce = 0f;
+
+        [Header("Bottom Soft Tether")]
+        [Tooltip("Automatically soft-tether the lowest free net particles so the bottom drags on the floor instead of being lifted as one loose ring.")]
+        public bool enableBottomSoftTether = true;
+
+        [Tooltip("Free particles within this world-space height above the lowest free rest particle are treated as the bottom/tail region.")]
+        [Min(0f)] public float bottomDetectHeight = 0.18f;
+
+        [Tooltip("XPBD-like compliance for bottom particles returning toward their rest area. Lower = stronger tether, higher = looser floor pile.")]
+        [Min(0f)] public float bottomTetherCompliance = 0.002f;
+
+        [Tooltip("Maximum distance bottom particles may drift from their rest area before an extra cap correction is applied. 0 disables the cap.")]
+        [Min(0f)] public float bottomTetherMaxDistance = 0.75f;
+
+        [Tooltip("Extra maximum lift above the bottom particle's rest height before a soft downward cap is applied. 0 disables the lift cap.")]
+        [Min(0f)] public float bottomMaxLiftHeight = 0.45f;
+
+        [Tooltip("Ground friction used for bottom particles while they touch the floor. Higher values make the bottom drag and gather more.")]
+        [Range(0f, 1f)] public float bottomGroundFriction = 0.75f;
 
         [Header("Stability")]
         [Tooltip("Velocity damping applied each substep: v *= (1 - damping). 0 = no damping, 1 = stop instantly.")]
@@ -215,11 +259,19 @@ namespace GoalNetXPBD
         private Vector3 _pendingBallImpulse;
         private float _pendingVelocityOpposingImpulse;
         private int _lastCollisionCount;
+        private Vector3 _previousBallCenter;
+        private Vector3 _currentBallCenter;
+        private Vector3 _sweepStartCenter;
+        private Vector3 _sweepEndCenter;
+        private bool _hasPreviousBallCenter;
         private int[] _spreadVisit;
         private int[] _spreadFrontier;
         private int[] _spreadNextFrontier;
         private int _spreadVisitToken;
         private bool[] _groundContacts;
+        private bool[] _bottomTetherParticles;
+        private Vector3[] _bottomRestWorld;
+        private int _bottomTetherCount;
 
         private bool _initialized;
 
@@ -264,6 +316,8 @@ namespace GoalNetXPBD
             _spreadFrontier = new int[n];
             _spreadNextFrontier = new int[n];
             _groundContacts = new bool[n];
+            _bottomTetherParticles = new bool[n];
+            _bottomRestWorld = new Vector3[n];
 
             // Particles start at rest pose, in world space.
             for (int i = 0; i < n; i++)
@@ -275,6 +329,7 @@ namespace GoalNetXPBD
                 _pinnedRestWorld[i] = wp;
             }
 
+            InitializeBottomTethers();
             transform.hasChanged = false;
             _initialized = true;
         }
@@ -295,16 +350,19 @@ namespace GoalNetXPBD
             RefreshCollisionTarget();
             _pendingBallImpulse = Vector3.zero;
             _pendingVelocityOpposingImpulse = 0f;
+            PrepareBallSweep();
 
             int s = Mathf.Max(1, substeps);
             float dt = fullDt / s;
 
             for (int step = 0; step < s; step++)
             {
+                SetSubstepBallSweep(step, s);
                 Substep(dt);
             }
 
             ApplyBallReactionImpulse();
+            StoreBallSweepEnd();
             WriteBackToMesh();
         }
 
@@ -320,6 +378,56 @@ namespace GoalNetXPBD
                     _pinnedRestWorld[i] = transform.TransformPoint(_data.restPositionsLocal[i]);
                 }
             }
+
+            RefreshBottomTetherRestWorld();
+        }
+
+        private void InitializeBottomTethers()
+        {
+            if (_data == null || _bottomTetherParticles == null) return;
+
+            System.Array.Clear(_bottomTetherParticles, 0, _bottomTetherParticles.Length);
+            _bottomTetherCount = 0;
+
+            float lowest = float.PositiveInfinity;
+            int n = _data.particleCount;
+            for (int i = 0; i < n; i++)
+            {
+                if (_data.invMass[i] <= 0f) continue;
+
+                float y = transform.TransformPoint(_data.restPositionsLocal[i]).y;
+                if (y < lowest) lowest = y;
+            }
+
+            if (float.IsPositiveInfinity(lowest)) return;
+
+            float limit = lowest + bottomDetectHeight;
+            for (int i = 0; i < n; i++)
+            {
+                Vector3 rest = transform.TransformPoint(_data.restPositionsLocal[i]);
+                _bottomRestWorld[i] = rest;
+
+                if (_data.invMass[i] <= 0f || rest.y > limit) continue;
+
+                _bottomTetherParticles[i] = true;
+                _bottomTetherCount++;
+            }
+
+            Debug.Log($"[GoalNetSimulator] Bottom soft tether particles: {_bottomTetherCount} (detectHeight={bottomDetectHeight:0.###}m).", this);
+        }
+
+        private void RefreshBottomTetherRestWorld()
+        {
+            if (_data == null || _bottomRestWorld == null) return;
+
+            int n = _data.particleCount;
+            for (int i = 0; i < n; i++)
+            {
+                if (_bottomTetherParticles != null && _bottomTetherParticles[i])
+                {
+                    _bottomRestWorld[i] = transform.TransformPoint(_data.restPositionsLocal[i]);
+                }
+            }
         }
 
         private void Substep(float dt)
@@ -328,6 +436,7 @@ namespace GoalNetXPBD
             float dt2 = dt * dt;
             float distanceAlphaTilde = distanceCompliance / dt2;
             float bendingAlphaTilde = bendingCompliance / dt2;
+            float bottomTetherAlphaTilde = bottomTetherCompliance / dt2;
 
             // 1. Predict.
             for (int i = 0; i < n; i++)
@@ -369,7 +478,8 @@ namespace GoalNetXPBD
                     SolveBending(bending[b], b, bendingAlphaTilde);
                 }
 
-                SolveBallCollision(dt);
+                SolveBallCollision(dt, iter);
+                SolveBottomSoftTethers(bottomTetherAlphaTilde);
                 SolveGroundCollision();
             }
 
@@ -439,6 +549,7 @@ namespace GoalNetXPBD
             {
                 _collisionSphere = null;
                 _collisionBody = null;
+                _hasPreviousBallCenter = false;
                 return;
             }
 
@@ -453,6 +564,7 @@ namespace GoalNetXPBD
             {
                 _collisionSphere = null;
                 _collisionBody = null;
+                _hasPreviousBallCenter = false;
                 return;
             }
 
@@ -467,15 +579,72 @@ namespace GoalNetXPBD
             }
         }
 
-        private void SolveBallCollision(float dt)
+        private void PrepareBallSweep()
+        {
+            if (_collisionSphere == null)
+            {
+                _hasPreviousBallCenter = false;
+                return;
+            }
+
+            _currentBallCenter = GetCollisionSphereCenter();
+            if (!_hasPreviousBallCenter)
+            {
+                _previousBallCenter = _currentBallCenter;
+                _hasPreviousBallCenter = true;
+            }
+
+            _sweepStartCenter = _previousBallCenter;
+            _sweepEndCenter = _currentBallCenter;
+        }
+
+        private void SetSubstepBallSweep(int step, int substepCount)
+        {
+            if (!_hasPreviousBallCenter || substepCount <= 0)
+            {
+                _sweepStartCenter = _currentBallCenter;
+                _sweepEndCenter = _currentBallCenter;
+                return;
+            }
+
+            float a = step / (float)substepCount;
+            float b = (step + 1) / (float)substepCount;
+            _sweepStartCenter = Vector3.Lerp(_previousBallCenter, _currentBallCenter, a);
+            _sweepEndCenter = Vector3.Lerp(_previousBallCenter, _currentBallCenter, b);
+        }
+
+        private void StoreBallSweepEnd()
+        {
+            if (_collisionSphere == null)
+            {
+                _hasPreviousBallCenter = false;
+                return;
+            }
+
+            _previousBallCenter = _currentBallCenter;
+            _hasPreviousBallCenter = true;
+        }
+
+        private Vector3 GetCollisionSphereCenter()
+        {
+            Transform sphereTransform = _collisionSphere.transform;
+            return sphereTransform.TransformPoint(_collisionSphere.center);
+        }
+
+        private float GetCollisionSphereRadius()
+        {
+            Transform sphereTransform = _collisionSphere.transform;
+            Vector3 lossyScale = sphereTransform.lossyScale;
+            float maxScale = Mathf.Max(Mathf.Abs(lossyScale.x), Mathf.Abs(lossyScale.y), Mathf.Abs(lossyScale.z));
+            return _collisionSphere.radius * maxScale + collisionSkin + collisionRadiusPadding;
+        }
+
+        private void SolveBallCollision(float dt, int solverIteration)
         {
             if (!enableBallCollision || _collisionSphere == null) return;
 
-            Transform sphereTransform = _collisionSphere.transform;
-            Vector3 center = sphereTransform.TransformPoint(_collisionSphere.center);
-            Vector3 lossyScale = sphereTransform.lossyScale;
-            float maxScale = Mathf.Max(Mathf.Abs(lossyScale.x), Mathf.Abs(lossyScale.y), Mathf.Abs(lossyScale.z));
-            float radius = _collisionSphere.radius * maxScale + collisionSkin + collisionRadiusPadding;
+            Vector3 center = _sweepEndCenter;
+            float radius = GetCollisionSphereRadius();
             float searchRadius = radius + collisionSearchMargin;
             float searchRadiusSqr = searchRadius * searchRadius;
             float radiusSqr = radius * radius;
@@ -517,6 +686,214 @@ namespace GoalNetXPBD
             {
                 ApplyPocketPressureField(center, radius, dt);
             }
+
+            if (solverIteration < sweptCollisionPassesPerSubstep)
+            {
+                SolveSweptBallCollision(dt, radius);
+            }
+        }
+
+        private void SolveSweptBallCollision(float dt, float baseRadius)
+        {
+            if (!enableSweptBallCollision) return;
+
+            Vector3 sweep = _sweepEndCenter - _sweepStartCenter;
+            if (sweep.sqrMagnitude <= 1e-8f) return;
+
+            float radius = baseRadius + sweptCollisionSkin;
+            float radiusSqr = radius * radius;
+            int sweptContacts = 0;
+
+            int n = _data.particleCount;
+            for (int i = 0; i < n; i++)
+            {
+                if (_data.invMass[i] <= 0f) continue;
+
+                Vector3 closest = ClosestPointOnSegment(_predicted[i], _sweepStartCenter, _sweepEndCenter);
+                Vector3 offset = _predicted[i] - closest;
+                float d2 = offset.sqrMagnitude;
+                if (d2 >= radiusSqr) continue;
+
+                Vector3 correction = BuildSweptCorrection(_predicted[i], closest, offset, d2, radius);
+                if (correction.sqrMagnitude <= 1e-12f) continue;
+
+                _predicted[i] += correction;
+                AccumulateBallReaction(correction, dt, sweptCollisionReactionScale);
+                SpreadCollisionCorrection(i, correction, dt);
+                ApplyBallImpactDrive(i, dt);
+                sweptContacts++;
+            }
+
+            if (enableSweptEdgeCollision)
+            {
+                sweptContacts += SolveSweptEdgeCollision(dt, radius, radiusSqr);
+            }
+
+            if (sweptContacts > 0)
+            {
+                ApplyPocketPressureField(_sweepEndCenter, baseRadius, dt);
+            }
+        }
+
+        private int SolveSweptEdgeCollision(float dt, float radius, float radiusSqr)
+        {
+            var edges = _data.edges;
+            int contactCount = 0;
+            int maxContacts = Mathf.Max(1, maxSweptEdgeContactsPerPass);
+            Vector3 min = Vector3.Min(_sweepStartCenter, _sweepEndCenter) - Vector3.one * radius;
+            Vector3 max = Vector3.Max(_sweepStartCenter, _sweepEndCenter) + Vector3.one * radius;
+
+            for (int i = 0; i < edges.Length; i++)
+            {
+                GoalNetMesh.Edge edge = edges[i];
+                int a = edge.a;
+                int b = edge.b;
+                float wa = _data.invMass[a];
+                float wb = _data.invMass[b];
+                if (wa + wb <= 0f) continue;
+
+                Vector3 pa = _predicted[a];
+                Vector3 pb = _predicted[b];
+                if (SegmentOutsideBounds(pa, pb, min, max)) continue;
+
+                ClosestSegmentPoints(_sweepStartCenter, _sweepEndCenter, pa, pb, out Vector3 sweepPoint, out Vector3 edgePoint, out float edgeT);
+
+                Vector3 offset = edgePoint - sweepPoint;
+                float d2 = offset.sqrMagnitude;
+                if (d2 >= radiusSqr) continue;
+
+                Vector3 correction = BuildSweptCorrection(edgePoint, sweepPoint, offset, d2, radius);
+                if (correction.sqrMagnitude <= 1e-12f) continue;
+
+                float edgeWa = 1f - edgeT;
+                float edgeWb = edgeT;
+                float denom = wa * edgeWa * edgeWa + wb * edgeWb * edgeWb;
+                if (denom <= 1e-8f) continue;
+
+                Vector3 corrA = correction * (wa * edgeWa / denom);
+                Vector3 corrB = correction * (wb * edgeWb / denom);
+
+                if (wa > 0f) _predicted[a] += corrA;
+                if (wb > 0f) _predicted[b] += corrB;
+
+                AccumulateBallReaction(correction, dt, sweptCollisionReactionScale);
+                if (sweptEdgeInfluenceSpread)
+                {
+                    SpreadCollisionCorrection(a, corrA, dt);
+                    SpreadCollisionCorrection(b, corrB, dt);
+                }
+                contactCount++;
+                if (contactCount >= maxContacts) break;
+            }
+
+            return contactCount;
+        }
+
+        private static bool SegmentOutsideBounds(Vector3 a, Vector3 b, Vector3 min, Vector3 max)
+        {
+            return (a.x < min.x && b.x < min.x) ||
+                   (a.x > max.x && b.x > max.x) ||
+                   (a.y < min.y && b.y < min.y) ||
+                   (a.y > max.y && b.y > max.y) ||
+                   (a.z < min.z && b.z < min.z) ||
+                   (a.z > max.z && b.z > max.z);
+        }
+
+        private Vector3 BuildSweptCorrection(Vector3 point, Vector3 closestOnSweep, Vector3 offset, float distanceSqr, float radius)
+        {
+            Vector3 normal;
+            if (distanceSqr > 1e-10f)
+            {
+                normal = offset / Mathf.Sqrt(distanceSqr);
+            }
+            else
+            {
+                Vector3 fallback = point - _sweepEndCenter;
+                normal = fallback.sqrMagnitude > 1e-10f ? fallback.normalized : Vector3.up;
+            }
+
+            Vector3 target = closestOnSweep + normal * radius;
+            Vector3 correction = target - point;
+            float maxCorrection = sweptCollisionMaxCorrection;
+            if (maxCorrection > 0f)
+            {
+                float magnitude = correction.magnitude;
+                if (magnitude > maxCorrection)
+                {
+                    correction *= maxCorrection / magnitude;
+                }
+            }
+
+            return correction;
+        }
+
+        private static Vector3 ClosestPointOnSegment(Vector3 point, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float abSqr = ab.sqrMagnitude;
+            if (abSqr <= 1e-10f) return a;
+
+            float t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / abSqr);
+            return a + ab * t;
+        }
+
+        private static void ClosestSegmentPoints(
+            Vector3 p1,
+            Vector3 q1,
+            Vector3 p2,
+            Vector3 q2,
+            out Vector3 c1,
+            out Vector3 c2,
+            out float t)
+        {
+            Vector3 d1 = q1 - p1;
+            Vector3 d2 = q2 - p2;
+            Vector3 r = p1 - p2;
+            float a = Vector3.Dot(d1, d1);
+            float e = Vector3.Dot(d2, d2);
+            float f = Vector3.Dot(d2, r);
+            float s;
+
+            if (a <= 1e-10f && e <= 1e-10f)
+            {
+                s = 0f;
+                t = 0f;
+            }
+            else if (a <= 1e-10f)
+            {
+                s = 0f;
+                t = Mathf.Clamp01(f / e);
+            }
+            else
+            {
+                float c = Vector3.Dot(d1, r);
+                if (e <= 1e-10f)
+                {
+                    t = 0f;
+                    s = Mathf.Clamp01(-c / a);
+                }
+                else
+                {
+                    float b = Vector3.Dot(d1, d2);
+                    float denom = a * e - b * b;
+                    s = denom != 0f ? Mathf.Clamp01((b * f - c * e) / denom) : 0f;
+                    t = (b * s + f) / e;
+
+                    if (t < 0f)
+                    {
+                        t = 0f;
+                        s = Mathf.Clamp01(-c / a);
+                    }
+                    else if (t > 1f)
+                    {
+                        t = 1f;
+                        s = Mathf.Clamp01((b - c) / a);
+                    }
+                }
+            }
+
+            c1 = p1 + d1 * s;
+            c2 = p2 + d2 * t;
         }
 
         private void AccumulateBallReaction(Vector3 particleCorrection, float dt)
@@ -742,6 +1119,57 @@ namespace GoalNetXPBD
             }
         }
 
+        private void SolveBottomSoftTethers(float alphaTilde)
+        {
+            if (!enableBottomSoftTether || _bottomTetherCount <= 0) return;
+
+            float stiffness = 1f / (1f + Mathf.Max(0f, alphaTilde));
+            float maxDistance = bottomTetherMaxDistance;
+            float maxLift = bottomMaxLiftHeight;
+            float floorY = GetGroundY() + groundSkin;
+
+            int n = _data.particleCount;
+            for (int i = 0; i < n; i++)
+            {
+                if (!_bottomTetherParticles[i] || _data.invMass[i] <= 0f) continue;
+
+                Vector3 target = _bottomRestWorld[i];
+                if (enableGroundCollision && target.y < floorY)
+                {
+                    target.y = floorY;
+                }
+
+                Vector3 p = _predicted[i];
+                Vector3 toTarget = target - p;
+                if (toTarget.sqrMagnitude > 1e-12f)
+                {
+                    _predicted[i] = p + toTarget * stiffness;
+                    p = _predicted[i];
+                }
+
+                if (maxDistance > 0f)
+                {
+                    Vector3 fromTarget = p - target;
+                    float dist = fromTarget.magnitude;
+                    if (dist > maxDistance && dist > 1e-6f)
+                    {
+                        _predicted[i] = target + fromTarget * (maxDistance / dist);
+                        p = _predicted[i];
+                    }
+                }
+
+                if (maxLift > 0f)
+                {
+                    float liftLimit = Mathf.Max(target.y, _bottomRestWorld[i].y) + maxLift;
+                    if (p.y > liftLimit)
+                    {
+                        p.y = Mathf.Lerp(p.y, liftLimit, stiffness);
+                        _predicted[i] = p;
+                    }
+                }
+            }
+        }
+
         private void ApplyGroundVelocityResponse(int particle)
         {
             if (_groundContacts == null || !_groundContacts[particle]) return;
@@ -752,7 +1180,13 @@ namespace GoalNetXPBD
                 v.y = -v.y * groundBounce;
             }
 
-            float tangentKeep = 1f - groundFriction;
+            float friction = groundFriction;
+            if (enableBottomSoftTether && _bottomTetherParticles != null && _bottomTetherParticles[particle])
+            {
+                friction = Mathf.Max(friction, bottomGroundFriction);
+            }
+
+            float tangentKeep = 1f - friction;
             v.x *= tangentKeep;
             v.z *= tangentKeep;
             _velocities[particle] = v;
@@ -876,7 +1310,15 @@ namespace GoalNetXPBD
                 _pinnedRestWorld[i] = wp;
             }
             transform.hasChanged = false;
+            RefreshBottomTetherRestWorld();
             WriteBackToMesh();
+        }
+
+        [ContextMenu("Rebuild Bottom Soft Tethers")]
+        public void RebuildBottomSoftTethers()
+        {
+            if (!_initialized) return;
+            InitializeBottomTethers();
         }
 
         [ContextMenu("Apply Realtime Preview Settings")]
@@ -891,6 +1333,14 @@ namespace GoalNetXPBD
             collisionSkin = 0.01f;
             collisionRadiusPadding = 0.11f;
             collisionSearchMargin = 0.05f;
+            enableSweptBallCollision = true;
+            enableSweptEdgeCollision = true;
+            sweptCollisionSkin = 0.02f;
+            sweptCollisionMaxCorrection = 0.12f;
+            sweptCollisionReactionScale = 0.35f;
+            sweptCollisionPassesPerSubstep = 2;
+            maxSweptEdgeContactsPerPass = 24;
+            sweptEdgeInfluenceSpread = false;
             enableCollisionInfluenceSpread = true;
             collisionSpreadStrength = 0.35f;
             collisionSpreadRings = 2;
@@ -911,17 +1361,23 @@ namespace GoalNetXPBD
             enableBallReaction = true;
             collisionParticleMass = 0.43f;
             reactionImpulseScale = 0.5f;
-            maxReactionImpulse = 6.5f;
+            maxReactionImpulse = 10f;
             velocityOpposingImpulseScale = 1f;
             enableSoftCatchReaction = true;
-            elasticReactionScale = 0.905f;
-            catchVelocityDamping = 0.878f;
-            maxContactReboundSpeed = 0.52f;
+            elasticReactionScale = 0.813f;
+            catchVelocityDamping = 0.573f;
+            maxContactReboundSpeed = 1.5f;
             enableGroundCollision = true;
             groundHeight = 0f;
             groundSkin = 0.005f;
             groundFriction = 0.35f;
             groundBounce = 0f;
+            enableBottomSoftTether = true;
+            bottomDetectHeight = 0.18f;
+            bottomTetherCompliance = 0.002f;
+            bottomTetherMaxDistance = 0.75f;
+            bottomMaxLiftHeight = 0.45f;
+            bottomGroundFriction = 0.75f;
             recalculateNormals = false;
             recalculateBounds = false;
             geometryRecalculateInterval = 8;
@@ -938,6 +1394,14 @@ namespace GoalNetXPBD
             collisionSkin = 0.01f;
             collisionRadiusPadding = 0.06f;
             collisionSearchMargin = 0.08f;
+            enableSweptBallCollision = true;
+            enableSweptEdgeCollision = true;
+            sweptCollisionSkin = 0.025f;
+            sweptCollisionMaxCorrection = 0.16f;
+            sweptCollisionReactionScale = 0.4f;
+            sweptCollisionPassesPerSubstep = 2;
+            maxSweptEdgeContactsPerPass = 40;
+            sweptEdgeInfluenceSpread = false;
             enableCollisionInfluenceSpread = true;
             collisionSpreadStrength = 0.45f;
             collisionSpreadRings = 2;
@@ -958,17 +1422,23 @@ namespace GoalNetXPBD
             enableBallReaction = true;
             collisionParticleMass = 0.5f;
             reactionImpulseScale = 0.5f;
-            maxReactionImpulse = 25f;
+            maxReactionImpulse = 10f;
             velocityOpposingImpulseScale = 1.25f;
             enableSoftCatchReaction = true;
-            elasticReactionScale = 0.905f;
-            catchVelocityDamping = 0.878f;
-            maxContactReboundSpeed = 0.52f;
+            elasticReactionScale = 0.813f;
+            catchVelocityDamping = 0.573f;
+            maxContactReboundSpeed = 1.5f;
             enableGroundCollision = true;
             groundHeight = 0f;
             groundSkin = 0.005f;
             groundFriction = 0.45f;
             groundBounce = 0f;
+            enableBottomSoftTether = true;
+            bottomDetectHeight = 0.2f;
+            bottomTetherCompliance = 0.0015f;
+            bottomTetherMaxDistance = 0.85f;
+            bottomMaxLiftHeight = 0.5f;
+            bottomGroundFriction = 0.8f;
             recalculateNormals = true;
             recalculateBounds = false;
             geometryRecalculateInterval = 5;
