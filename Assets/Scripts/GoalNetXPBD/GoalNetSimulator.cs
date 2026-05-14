@@ -150,6 +150,22 @@ namespace GoalNetXPBD
         [Tooltip("How much pocket-pressure displacement contributes to ball reaction impulse.")]
         [Range(0f, 1f)] public float pocketPressureReactionScale = 0.04f;
 
+        [Header("Persistent Contact Patch")]
+        [Tooltip("Keep recently contacted particles active for a few FixedUpdates so fast shots do not flicker between contact/no-contact frames.")]
+        public bool enablePersistentContactPatch = true;
+
+        [Tooltip("How many FixedUpdates a direct or swept contact particle remains in the contact patch.")]
+        [Range(1, 12)] public int contactPatchLifetime = 4;
+
+        [Tooltip("Extra radius around the solver ball where recent contact particles may continue to apply soft projection.")]
+        [Min(0f)] public float contactPatchExtraRadius = 0.08f;
+
+        [Tooltip("Fraction of the projection correction applied to persistent patch particles. Lower values stabilize contact without making the ball sticky.")]
+        [Range(0f, 1f)] public float contactPatchProjectionStrength = 0.45f;
+
+        [Tooltip("How much persistent patch correction contributes to ball reaction impulse.")]
+        [Range(0f, 1f)] public float contactPatchReactionScale = 0.12f;
+
         [Header("Ball Reaction (Phase 4)")]
         [Tooltip("Apply the opposite of net particle collision corrections back to the active Rigidbody.")]
         public bool enableBallReaction = true;
@@ -238,6 +254,15 @@ namespace GoalNetXPBD
         [Tooltip("Draw pinned (red) / free (green) particles as Gizmos when the simulator is selected.")]
         public bool drawDebugGizmos = false;
 
+        [Tooltip("Draw recent contact patch particles in magenta.")]
+        public bool drawContactPatchGizmos = true;
+
+        [Tooltip("Draw the ball swept path and solver collision spheres.")]
+        public bool drawSweptPathGizmos = true;
+
+        [Tooltip("Draw the horizontal ground contact plane near the net.")]
+        public bool drawGroundGizmos = false;
+
         [Tooltip("Pause the solver — particles freeze in place. Toggle to inspect a specific frame.")]
         public bool pauseSimulation = false;
 
@@ -272,8 +297,28 @@ namespace GoalNetXPBD
         private bool[] _bottomTetherParticles;
         private Vector3[] _bottomRestWorld;
         private int _bottomTetherCount;
+        private int[] _contactPatchLife;
+        private int _lastPersistentPatchCount;
+        private int _lastDirectContactCount;
+        private int _lastSweptParticleContactCount;
+        private int _lastSweptEdgeContactCount;
+        private int _lastPatchSolveContactCount;
+        private float _lastBallSpeed;
+        private Vector3 _lastAppliedBallImpulse;
 
         private bool _initialized;
+
+        public int ParticleCount => _data != null ? _data.particleCount : 0;
+        public int EdgeCount => _data != null && _data.edges != null ? _data.edges.Length : 0;
+        public int BendingConstraintCount => _data != null && _data.bendingConstraints != null ? _data.bendingConstraints.Length : 0;
+        public int BottomTetherCount => _bottomTetherCount;
+        public int LastDirectContactCount => _lastDirectContactCount;
+        public int LastSweptParticleContactCount => _lastSweptParticleContactCount;
+        public int LastSweptEdgeContactCount => _lastSweptEdgeContactCount;
+        public int LastPersistentPatchCount => _lastPersistentPatchCount;
+        public int LastPatchSolveContactCount => _lastPatchSolveContactCount;
+        public float LastBallSpeed => _lastBallSpeed;
+        public Vector3 LastAppliedBallImpulse => _lastAppliedBallImpulse;
 
         private void Start()
         {
@@ -318,6 +363,7 @@ namespace GoalNetXPBD
             _groundContacts = new bool[n];
             _bottomTetherParticles = new bool[n];
             _bottomRestWorld = new Vector3[n];
+            _contactPatchLife = new int[n];
 
             // Particles start at rest pose, in world space.
             for (int i = 0; i < n; i++)
@@ -350,6 +396,13 @@ namespace GoalNetXPBD
             RefreshCollisionTarget();
             _pendingBallImpulse = Vector3.zero;
             _pendingVelocityOpposingImpulse = 0f;
+            _lastAppliedBallImpulse = Vector3.zero;
+            _lastDirectContactCount = 0;
+            _lastSweptParticleContactCount = 0;
+            _lastSweptEdgeContactCount = 0;
+            _lastPatchSolveContactCount = 0;
+            _lastBallSpeed = _collisionBody != null ? _collisionBody.velocity.magnitude : 0f;
+            DecayPersistentContactPatch();
             PrepareBallSweep();
 
             int s = Mathf.Max(1, substeps);
@@ -665,6 +718,7 @@ namespace GoalNetXPBD
                     Vector3 correction = center + offset * (radius / Mathf.Sqrt(d2)) - oldPosition;
                     _predicted[i] = oldPosition + correction;
                     AccumulateBallReaction(correction, dt);
+                    RegisterPersistentContact(i);
                     SpreadCollisionCorrection(i, correction, dt);
                     ApplyBallImpactDrive(i, dt);
                 }
@@ -674,6 +728,7 @@ namespace GoalNetXPBD
                     Vector3 correction = center + Vector3.up * radius - oldPosition;
                     _predicted[i] = oldPosition + correction;
                     AccumulateBallReaction(correction, dt);
+                    RegisterPersistentContact(i);
                     SpreadCollisionCorrection(i, correction, dt);
                     ApplyBallImpactDrive(i, dt);
                 }
@@ -684,8 +739,11 @@ namespace GoalNetXPBD
 
             if (directContacts > 0)
             {
+                _lastDirectContactCount += directContacts;
                 ApplyPocketPressureField(center, radius, dt);
             }
+
+            SolvePersistentContactPatch(center, radius, dt);
 
             if (solverIteration < sweptCollisionPassesPerSubstep)
             {
@@ -719,8 +777,10 @@ namespace GoalNetXPBD
 
                 _predicted[i] += correction;
                 AccumulateBallReaction(correction, dt, sweptCollisionReactionScale);
+                RegisterPersistentContact(i);
                 SpreadCollisionCorrection(i, correction, dt);
                 ApplyBallImpactDrive(i, dt);
+                _lastSweptParticleContactCount++;
                 sweptContacts++;
             }
 
@@ -777,16 +837,96 @@ namespace GoalNetXPBD
                 if (wb > 0f) _predicted[b] += corrB;
 
                 AccumulateBallReaction(correction, dt, sweptCollisionReactionScale);
+                RegisterPersistentContact(a);
+                RegisterPersistentContact(b);
                 if (sweptEdgeInfluenceSpread)
                 {
                     SpreadCollisionCorrection(a, corrA, dt);
                     SpreadCollisionCorrection(b, corrB, dt);
                 }
                 contactCount++;
+                _lastSweptEdgeContactCount++;
                 if (contactCount >= maxContacts) break;
             }
 
             return contactCount;
+        }
+
+        private void RegisterPersistentContact(int particle)
+        {
+            if (!enablePersistentContactPatch || _contactPatchLife == null) return;
+            if ((uint)particle >= (uint)_contactPatchLife.Length) return;
+            if (_data.invMass[particle] <= 0f) return;
+
+            _contactPatchLife[particle] = Mathf.Max(1, contactPatchLifetime);
+        }
+
+        private void DecayPersistentContactPatch()
+        {
+            _lastPersistentPatchCount = 0;
+            if (_contactPatchLife == null) return;
+
+            for (int i = 0; i < _contactPatchLife.Length; i++)
+            {
+                if (_contactPatchLife[i] <= 0) continue;
+
+                _contactPatchLife[i]--;
+                if (_contactPatchLife[i] > 0)
+                {
+                    _lastPersistentPatchCount++;
+                }
+            }
+        }
+
+        private void SolvePersistentContactPatch(Vector3 center, float radius, float dt)
+        {
+            if (!enablePersistentContactPatch || _contactPatchLife == null) return;
+            if (contactPatchProjectionStrength <= 0f) return;
+
+            float activeRadius = radius + contactPatchExtraRadius;
+            float activeRadiusSqr = activeRadius * activeRadius;
+            float radiusSqr = radius * radius;
+            int contacts = 0;
+
+            for (int i = 0; i < _contactPatchLife.Length; i++)
+            {
+                if (_contactPatchLife[i] <= 0 || _data.invMass[i] <= 0f) continue;
+
+                Vector3 offset = _predicted[i] - center;
+                float d2 = offset.sqrMagnitude;
+                if (d2 > activeRadiusSqr) continue;
+
+                Vector3 correction;
+                if (d2 < radiusSqr)
+                {
+                    if (d2 > 1e-10f)
+                    {
+                        correction = center + offset * (radius / Mathf.Sqrt(d2)) - _predicted[i];
+                    }
+                    else
+                    {
+                        correction = center + Vector3.up * radius - _predicted[i];
+                    }
+                }
+                else
+                {
+                    contacts++;
+                    continue;
+                }
+
+                correction *= contactPatchProjectionStrength;
+                if (correction.sqrMagnitude <= 1e-12f) continue;
+
+                _predicted[i] += correction;
+                AccumulateBallReaction(correction, dt, contactPatchReactionScale);
+                contacts++;
+            }
+
+            if (contacts > 0)
+            {
+                _lastPatchSolveContactCount += contacts;
+                ApplyPocketPressureField(center, radius, dt);
+            }
         }
 
         private static bool SegmentOutsideBounds(Vector3 a, Vector3 b, Vector3 min, Vector3 max)
@@ -1224,6 +1364,7 @@ namespace GoalNetXPBD
             if (impulse.sqrMagnitude > 1e-10f)
             {
                 _collisionBody.AddForce(impulse, ForceMode.Impulse);
+                _lastAppliedBallImpulse = impulse;
             }
         }
 
@@ -1311,6 +1452,11 @@ namespace GoalNetXPBD
             }
             transform.hasChanged = false;
             RefreshBottomTetherRestWorld();
+            if (_contactPatchLife != null)
+            {
+                System.Array.Clear(_contactPatchLife, 0, _contactPatchLife.Length);
+                _lastPersistentPatchCount = 0;
+            }
             WriteBackToMesh();
         }
 
@@ -1358,6 +1504,11 @@ namespace GoalNetXPBD
             pocketPressureMaxStep = 0.08f;
             pocketPressureFalloffPower = 1f;
             pocketPressureReactionScale = 0.04f;
+            enablePersistentContactPatch = true;
+            contactPatchLifetime = 4;
+            contactPatchExtraRadius = 0.08f;
+            contactPatchProjectionStrength = 0.45f;
+            contactPatchReactionScale = 0.12f;
             enableBallReaction = true;
             collisionParticleMass = 0.43f;
             reactionImpulseScale = 0.5f;
@@ -1378,6 +1529,62 @@ namespace GoalNetXPBD
             bottomTetherMaxDistance = 0.75f;
             bottomMaxLiftHeight = 0.45f;
             bottomGroundFriction = 0.75f;
+            recalculateNormals = false;
+            recalculateBounds = false;
+            geometryRecalculateInterval = 8;
+        }
+
+        [ContextMenu("Apply Stable 45mps Catch Settings")]
+        public void ApplyStable45mpsCatchSettings()
+        {
+            ApplyRealtimePreviewSettings();
+            maxReactionImpulse = 10f;
+            velocityOpposingImpulseScale = 1f;
+            elasticReactionScale = 0.813f;
+            catchVelocityDamping = 0.573f;
+            maxContactReboundSpeed = 1.5f;
+            contactPatchLifetime = 4;
+            contactPatchProjectionStrength = 0.45f;
+            bottomGroundFriction = 0.75f;
+        }
+
+        [ContextMenu("Apply High Speed 50mps Catch Settings")]
+        public void ApplyHighSpeed50mpsCatchSettings()
+        {
+            ApplyRealtimePreviewSettings();
+            substeps = 3;
+            iterations = 8;
+            collisionSearchMargin = 0.08f;
+            sweptCollisionSkin = 0.035f;
+            sweptCollisionMaxCorrection = 0.1f;
+            maxSweptEdgeContactsPerPass = 18;
+            contactPatchLifetime = 5;
+            contactPatchExtraRadius = 0.1f;
+            contactPatchProjectionStrength = 0.5f;
+            maxReactionImpulse = 12f;
+        }
+
+        [ContextMenu("Apply Loose Net Pile Settings")]
+        public void ApplyLooseNetPileSettings()
+        {
+            ApplyRealtimePreviewSettings();
+            distanceCompliance = 1e-5f;
+            bendingCompliance = 0.02f;
+            groundFriction = 0.45f;
+            bottomDetectHeight = 0.28f;
+            bottomTetherCompliance = 0.005f;
+            bottomTetherMaxDistance = 1.1f;
+            bottomMaxLiftHeight = 0.65f;
+            bottomGroundFriction = 0.85f;
+        }
+
+        [ContextMenu("Apply Debug Visualization Settings")]
+        public void ApplyDebugVisualizationSettings()
+        {
+            drawDebugGizmos = true;
+            drawContactPatchGizmos = true;
+            drawSweptPathGizmos = true;
+            drawGroundGizmos = true;
             recalculateNormals = false;
             recalculateBounds = false;
             geometryRecalculateInterval = 8;
@@ -1419,6 +1626,11 @@ namespace GoalNetXPBD
             pocketPressureMaxStep = 0.1f;
             pocketPressureFalloffPower = 0.9f;
             pocketPressureReactionScale = 0.05f;
+            enablePersistentContactPatch = true;
+            contactPatchLifetime = 5;
+            contactPatchExtraRadius = 0.1f;
+            contactPatchProjectionStrength = 0.5f;
+            contactPatchReactionScale = 0.15f;
             enableBallReaction = true;
             collisionParticleMass = 0.5f;
             reactionImpulseScale = 0.5f;
@@ -1463,6 +1675,36 @@ namespace GoalNetXPBD
                 float maxScale = Mathf.Max(Mathf.Abs(lossyScale.x), Mathf.Abs(lossyScale.y), Mathf.Abs(lossyScale.z));
                 float radius = _collisionSphere.radius * maxScale + collisionSkin + collisionRadiusPadding;
                 Gizmos.DrawWireSphere(center, radius);
+
+                if (drawSweptPathGizmos)
+                {
+                    Gizmos.color = new Color(1f, 0.6f, 0f, 1f);
+                    Gizmos.DrawLine(_sweepStartCenter, _sweepEndCenter);
+                    Gizmos.DrawWireSphere(_sweepStartCenter, radius + sweptCollisionSkin);
+                    Gizmos.DrawWireSphere(_sweepEndCenter, radius + sweptCollisionSkin);
+
+                    Gizmos.color = new Color(1f, 0.2f, 1f, 0.9f);
+                    Gizmos.DrawWireSphere(center, radius + contactPatchExtraRadius);
+                }
+            }
+
+            if (drawContactPatchGizmos && _contactPatchLife != null)
+            {
+                Gizmos.color = new Color(1f, 0f, 1f, 1f);
+                for (int i = 0; i < _contactPatchLife.Length; i++)
+                {
+                    if (_contactPatchLife[i] <= 0) continue;
+                    Gizmos.DrawSphere(_positions[i], 0.035f);
+                }
+            }
+
+            if (drawGroundGizmos)
+            {
+                float y = GetGroundY() + groundSkin;
+                Vector3 center = transform.position;
+                center.y = y;
+                Gizmos.color = new Color(0.2f, 0.8f, 1f, 0.6f);
+                Gizmos.DrawWireCube(center, new Vector3(4f, 0.01f, 4f));
             }
         }
 #endif
